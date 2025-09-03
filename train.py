@@ -19,7 +19,7 @@ import argparse
 import math
 import os
 from dataclasses import dataclass, asdict
-from typing import Optional, Tuple, List
+from typing import Optional, Tuple, List, Sequence
 
 import numpy as np
 import torch
@@ -27,6 +27,14 @@ from torch import nn
 from torch.utils.data import Dataset
 
 from models.gat_autoencoder import GATPointCloudAutoencoder, chamfer_distance
+import h5py  # for ModelNet40 HDF5 loading
+
+# Optional progress bar
+try:  # pragma: no cover - optional dependency
+    from tqdm import tqdm
+except Exception:  # pragma: no cover
+    def tqdm(x, *args, **kwargs):  # type: ignore
+        return x
 
 try:
     from torch_geometric.data import Data
@@ -94,6 +102,7 @@ class PointCloudDataset(Dataset):
         scale_min: float = 0.8,
         scale_max: float = 1.2,
         device: Optional[torch.device] = None,
+        labels: Optional[np.ndarray] = None,  # optional per-cloud integer labels
     ) -> None:
         super().__init__()
         if array.ndim == 2:  # single cloud
@@ -112,6 +121,11 @@ class PointCloudDataset(Dataset):
         self.scale_min = scale_min
         self.scale_max = scale_max
         self.device = device
+        if labels is not None:
+            labels = np.asarray(labels)
+            if labels.shape[0] != self.S:
+                raise ValueError("labels length must match number of clouds")
+        self.labels = labels
 
     def __len__(self) -> int:
         return self.S
@@ -144,7 +158,11 @@ class PointCloudDataset(Dataset):
         if self.augment:
             pts = self._augment(pts)
         edge_index = build_knn_graph(pts[:, :3], k=self.k)
-        data = Data(x=pts, pos=pts[:, :3], edge_index=edge_index)
+        if self.labels is not None:
+            y = torch.tensor(int(self.labels[idx]), dtype=torch.long)
+            data = Data(x=pts, pos=pts[:, :3], edge_index=edge_index, y=y)
+        else:
+            data = Data(x=pts, pos=pts[:, :3], edge_index=edge_index)
         return data
 
 
@@ -178,12 +196,23 @@ class TrainConfig:
     save_dir: str = "runs"
     tag: str = "default"
     save_every: int = 50
+    # ModelNet40 specific (HDF5) optional inputs
+    modelnet40_train_list: Optional[str] = None  # path to train_files.txt
+    modelnet40_shape_names: Optional[str] = None  # path to shape_names.txt
+    limit_samples: Optional[int] = None  # optional cap on total samples loaded
+    filter_classes: Optional[Tuple[str, ...]] = None  # subset of class names to include
+    progress: bool = True  # show tqdm progress bars
 
 
 def parse_args() -> TrainConfig:
     p = argparse.ArgumentParser(description="Train GAT point cloud autoencoder")
     p.add_argument("--data", type=str, help="Path to a .npy file containing point cloud(s)")
     p.add_argument("--data-dir", type=str, help="Directory containing multiple .npy point cloud files")
+    p.add_argument("--modelnet40-train-list", type=str, help="Path to ModelNet40 train_files.txt (HDF5 list)")
+    p.add_argument("--modelnet40-shape-names", type=str, help="Path to shape_names.txt for ModelNet40")
+    p.add_argument("--limit-samples", type=int, help="Limit total samples loaded (for large datasets)")
+    p.add_argument("--filter-classes", nargs="*", help="Subset of class names to include (ModelNet40)")
+    p.add_argument("--no-progress", action="store_true", help="Disable tqdm progress bars")
     p.add_argument("--epochs", type=int, default=200)
     p.add_argument("--batch-size", type=int, default=4)
     p.add_argument("--k", type=int, default=16)
@@ -210,11 +239,17 @@ def parse_args() -> TrainConfig:
     p.add_argument("--tag", type=str, default="default")
     p.add_argument("--save-every", type=int, default=50)
     args = p.parse_args()
-    if not args.data and not args.data_dir:
-        p.error("You must provide either --data or --data-dir")
+    provided_sources = sum(bool(x) for x in [args.data, args.data_dir, args.modelnet40_train_list])
+    if provided_sources != 1:
+        p.error("Provide exactly one of --data, --data-dir, or --modelnet40-train-list")
     return TrainConfig(
         data=args.data,
         data_dir=args.data_dir,
+        modelnet40_train_list=args.modelnet40_train_list,
+        modelnet40_shape_names=args.modelnet40_shape_names,
+        limit_samples=args.limit_samples,
+        filter_classes=tuple(args.filter_classes) if args.filter_classes else None,
+    progress=not args.no_progress,
         epochs=args.epochs,
         batch_size=args.batch_size,
         k=args.k,
@@ -278,6 +313,116 @@ def load_data_dir(path: str) -> np.ndarray:
     return stacked
 
 
+def load_modelnet40(
+    list_path: str,
+    shape_names_path: Optional[str] = None,
+    limit_samples: Optional[int] = None,
+    filter_classes: Optional[Sequence[str]] = None,
+) -> tuple[np.ndarray, np.ndarray, List[str]]:
+    """Load ModelNet40 HDF5 shards listed in train_files.txt.
+
+    Returns (clouds, labels, shape_names) where:
+      clouds: (S, N, 3) float32
+      labels: (S,) int64
+      shape_names: list[str]
+    """
+    # Resolve list_path flexibly:
+    # 1. If a directory is provided, append 'train_files.txt'
+    # 2. If file does not exist, attempt relative to CWD and relative to its parent directory.
+    original_list_path = list_path
+    if os.path.isdir(list_path):
+        candidate = os.path.join(list_path, "train_files.txt")
+        if os.path.exists(candidate):
+            list_path = candidate
+    if not os.path.exists(list_path):
+        # Try relative to current working directory explicitly
+        cwd_candidate = os.path.join(os.getcwd(), list_path)
+        if os.path.exists(cwd_candidate):
+            list_path = cwd_candidate
+        else:
+            # Try joining parent directory if path looks like just a filename
+            parent_dir = os.path.dirname(original_list_path) or os.getcwd()
+            alt_candidate = os.path.join(parent_dir, os.path.basename(list_path))
+            if os.path.exists(alt_candidate):
+                list_path = alt_candidate
+    if not os.path.exists(list_path):
+        raise FileNotFoundError(
+            f"ModelNet40 train list file not found. Tried: '{original_list_path}'. "
+            f"Ensure you pass --modelnet40-train-list point_cloud_data/modelnet40_ply_hdf5_2048/train_files.txt"
+        )
+
+    with open(list_path, "r") as f:
+        shard_paths = [ln.strip() for ln in f if ln.strip()]
+    base_dir = os.path.dirname(list_path)
+    resolved = []
+    for p in shard_paths:
+        # Paths in file may be relative to project root; attempt direct then relative to base_dir
+        if os.path.exists(p):
+            resolved.append(p)
+        else:
+            alt = os.path.join(base_dir, os.path.basename(p)) if not os.path.isabs(p) else p
+            if os.path.exists(alt):
+                resolved.append(alt)
+            else:
+                raise FileNotFoundError(f"Shard not found: {p}")
+    if not resolved:
+        raise FileNotFoundError("No shard paths resolved from list file")
+
+    shape_names: List[str] = []
+    if shape_names_path and os.path.exists(shape_names_path):
+        with open(shape_names_path, "r") as f:
+            shape_names = [ln.strip() for ln in f if ln.strip()]
+    # Map filter_classes to label ids if provided
+    allowed_label_ids: Optional[set[int]] = None
+    if filter_classes:
+        if not shape_names:
+            raise ValueError("--filter-classes requires --modelnet40-shape-names")
+        name_to_id = {n: i for i, n in enumerate(shape_names)}
+        missing = [c for c in filter_classes if c not in name_to_id]
+        if missing:
+            raise ValueError(f"Unknown class names in filter: {missing}")
+        allowed_label_ids = {name_to_id[c] for c in filter_classes}
+
+    clouds_list: List[np.ndarray] = []
+    labels_list: List[int] = []
+    total_loaded = 0
+    # Precompute total count for progress bar if possible
+    shard_counts = []
+    for shard in resolved:
+        with h5py.File(shard, "r") as h5f:
+            shard_counts.append(h5f["data"].shape[0])
+    est_total = sum(shard_counts)
+    if allowed_label_ids is not None:
+        est_total = None  # filtering makes estimate unreliable
+    outer_iter = resolved
+    if est_total and est_total > 0:
+        outer_iter = tqdm(resolved, desc="Loading shards", disable=False)
+    for shard in outer_iter:
+        with h5py.File(shard, "r") as h5f:
+            data = h5f["data"][:]  # (num, 2048, 3)
+            labels = h5f["label"][:]  # (num, 1)
+        labels = labels.reshape(-1)
+        if allowed_label_ids is not None:
+            mask = np.isin(labels, list(allowed_label_ids))
+            data = data[mask]
+            labels = labels[mask]
+        inner_iter = range(data.shape[0])
+        inner_iter = tqdm(inner_iter, desc=f"Samples {os.path.basename(shard)}", leave=False) if (limit_samples is None or limit_samples > 500) else inner_iter
+        for i in inner_iter:
+            clouds_list.append(data[i].astype(np.float32))
+            labels_list.append(int(labels[i]))
+            total_loaded += 1
+            if limit_samples and total_loaded >= limit_samples:
+                break
+        if limit_samples and total_loaded >= limit_samples:
+            break
+    if not clouds_list:
+        raise ValueError("No samples loaded from ModelNet40 dataset (check filters)")
+    clouds = np.stack(clouds_list, axis=0)  # (S, N, 3)
+    labels_arr = np.asarray(labels_list, dtype=np.int64)
+    return clouds, labels_arr, shape_names
+
+
 def main(cfg: TrainConfig):  # noqa: D401
     os.makedirs(cfg.save_dir, exist_ok=True)
     run_dir = os.path.join(cfg.save_dir, cfg.tag)
@@ -286,7 +431,21 @@ def main(cfg: TrainConfig):  # noqa: D401
         for k, v in asdict(cfg).items():
             f.write(f"{k}: {v}\n")
 
-    if cfg.data_dir:
+    labels: Optional[np.ndarray] = None
+    shape_names: List[str] = []
+    if cfg.modelnet40_train_list:
+        print("Loading ModelNet40 shards...")
+        array, labels, shape_names = load_modelnet40(
+            cfg.modelnet40_train_list,
+            shape_names_path=cfg.modelnet40_shape_names,
+            limit_samples=cfg.limit_samples,
+            filter_classes=cfg.filter_classes,
+        )
+        print(f"Loaded ModelNet40 samples: {array.shape[0]} | Points: {array.shape[1]} | Features: {array.shape[2]}")
+        if cfg.in_channels != 3:
+            print("Overriding in_channels -> 3 for ModelNet40 dataset")
+            cfg.in_channels = 3
+    elif cfg.data_dir:
         array = load_data_dir(cfg.data_dir)
     elif cfg.data:
         array = load_data(cfg.data)
@@ -309,6 +468,7 @@ def main(cfg: TrainConfig):  # noqa: D401
         scale_augment=cfg.scale_augment,
         scale_min=cfg.scale_min,
         scale_max=cfg.scale_max,
+        labels=labels,
     )
     loader = DataLoader(dataset, batch_size=cfg.batch_size, shuffle=True)
 
@@ -347,7 +507,9 @@ def main(cfg: TrainConfig):  # noqa: D401
     for epoch in range(1, cfg.epochs + 1):
         model.train()
         total_loss = 0.0
-        for batch in loader:
+        batch_iter = loader
+        batch_iter = tqdm(loader, desc=f"Epoch {epoch}/{cfg.epochs}", leave=False, disable=not cfg.progress)
+        for batch in batch_iter:
             batch = batch.to(device)
             recon, z = model(batch.x, batch.edge_index)
             batch_vec = getattr(batch, 'batch', None)
@@ -356,8 +518,13 @@ def main(cfg: TrainConfig):  # noqa: D401
             loss.backward()
             opt.step()
             total_loss += loss.item() * batch.num_graphs
+            if cfg.progress:
+                batch_iter.set_postfix(loss=loss.item())
         avg_loss = total_loss / len(loader.dataset)
-        print(f"Epoch {epoch:04d} | loss {avg_loss:.6f}")
+        if cfg.progress:
+            print(f"Epoch {epoch:04d} | loss {avg_loss:.6f}")
+        else:
+            print(f"Epoch {epoch:04d} | loss {avg_loss:.6f}")
 
         if avg_loss < best_loss:
             best_loss = avg_loss

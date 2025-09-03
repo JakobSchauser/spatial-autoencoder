@@ -1,9 +1,0 @@
-cone_surface
-cube_surface
-cylinder_surface
-disk
-pyramid_square_surface
-sphere_surface
-square_plane
-torus_surface
-triangle_eq
