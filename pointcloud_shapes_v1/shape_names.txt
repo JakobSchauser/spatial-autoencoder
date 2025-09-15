@@ -1,0 +1,9 @@
+cone
+cube
+cylinder
+disk
+pyramid_square
+sphere
+square_plane
+torus
+triangle_eq

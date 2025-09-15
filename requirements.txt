@@ -1,5 +1,0 @@
-torch
-torch_geometric
-numpy
-matplotlib
-h5py
